@@ -1,363 +1,425 @@
 """
-Analizador Sintactico JSON simplificado basado en TP1 Analizador Lexico.
-Version extendida: Lexer + Parser (Analizador sintactico descendente recursivo)
-Detecta errores lexicos y sintacticos (panic-mode con sincronizacion).
+  ANALIZADOR LEXICO + SINTACTICO PARA JSON SIMPLIFICADO
+  Tarea 2 - Analisis Sintactico Descendente Recursivo
+  Detecta errores lexicos y sintacticos (panic-mode con sincronizacion).
+
+  Uso:
+      python analizador_json.py                 -> fuente.txt
+      python analizador_json.py entrada.json    -> archivo personalizado
 """
+
 import re
 import sys
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
+
 
 #Definicion de tokens a usar en el analisis lexico para el JSON simplificado
 TOKENS = [
-    ("L_CORCHETE", re.compile(r"\[")),
-    ("R_CORCHETE", re.compile(r"\]")),
-    ("L_LLAVE", re.compile(r"\{")),
-    ("R_LLAVE", re.compile(r"\}")),
-    ("COMA", re.compile(r",")),
-    ("DOS_PUNTOS", re.compile(r":")),
-    ("LITERAL_CADENA", re.compile(r"\"(?:[^\"\\]|\\.)*\"")),#Expresion regular para cadenas JSON que empiecen y terminen con comillas dobles
-    ("LITERAL_NUM", re.compile(r"[0-9]+(?:\.[0-9]+)?(?:(?:e|E)(?:\+|-)?[0-9]+)?")),#Expresion regular para números enteros y decimales con notacion cientifica opcional
-    ("PR_TRUE", re.compile(r"(?:true|TRUE)")),
-    ("PR_FALSE", re.compile(r"(?:false|FALSE)")),
-    ("PR_NULL", re.compile(r"(?:null|NULL)")),
+    #Delimitadores
+    ("L_CORCHETE",     re.compile(r"\[")),
+    ("R_CORCHETE",     re.compile(r"\]")),
+    ("L_LLAVE",        re.compile(r"\{")),
+    ("R_LLAVE",        re.compile(r"\}")),
+    ("COMA",           re.compile(r",")),
+    ("DOS_PUNTOS",     re.compile(r":")),
+    #Literales
+    ("LITERAL_CADENA", re.compile(r'"(?:[^"\\]|\\.)*"')),#Expresion regular para cadenas JSON que empiecen y terminen con comillas dobles
+    ("LITERAL_NUM",    re.compile(r"[0-9]+(?:\.[0-9]+)?(?:(?:e|E)(?:\+|-)?[0-9]+)?")),#Expresion regular para numeros enteros y decimales con notacion cientifica opcional
+    #Palabras reservadas — \b es obligatorio para no consumir prefijos de identificadores mas largos (ej: "nullXYZ" no debe tokenizarse como PR_NULL + error)
+    ("PR_TRUE",        re.compile(r"(?:true|TRUE)\b")),
+    ("PR_FALSE",       re.compile(r"(?:false|FALSE)\b")),
+    ("PR_NULL",        re.compile(r"(?:null|NULL)\b")),
 ]
 
-WHITESPACE = re.compile(r"\s+")#Expresion regular para espacios en blanco
+WHITESPACE = re.compile(r"[ \t\r]+")#Expresion regular para espacios en blanco horizontales (espacio, tabulacion)
 
-
+#Clase que representa un token con su tipo, lexema y posicionen el texto (linea y columna)
 @dataclass
-class Token:#Clase que representa un token con su tipo, lexema y posicion
-    type: str
-    lexeme: str
-    line: int
-    col: int
+class Token:
+    """Unidad lexica: tipo, lexema, numero de linea y columna."""
+    tipo:   str
+    lexema: str
+    linea:  int
+    col:    int
 
     def __repr__(self):
-        return f"{self.type}({self.lexeme!r})@{self.line}:{self.col}"
+        return f"{self.tipo}({self.lexema!r})@{self.linea}:{self.col}"
 
 
-class Lexer:#Clase que implementa el analizador lexico Mejorado
-    def __init__(self, text: str):#Inicializa el lexer con el texto de entrada y establece la posicion inicial
-        self.text = text
-        self.pos = 0
-        self.line = 1
-        self.col = 1
-        self.n = len(text)
+#Centinela global de fin de archivo
+EOF_TOKEN = Token("EOF", "", -1, -1)
 
-    def _advance_whitespace(self):#Funcion para avanzar sobre espacios en blanco y actualizar contadores de linea y columna
-        """Consume whitespace y actualiza los contadores de linea/col"""
-        m = WHITESPACE.match(self.text, self.pos)
+class Lexer:
+    """
+    Analizador lexico: Recorre el texto completo caracter a caracter, actualiza contadores de 
+    linea y columna, y produce tokens con posicion exacta (linea + columna).
+    Estrategia de errores:
+        Ante un caracter invalido lo reporta en stderr, lo salta y continua
+        tokenizando el resto del archivo (no aborta ante el primer error).
+    """
+    def __init__(self, texto: str):#Inicializa el lexer con el texto de entrada y establece la posicion inicial
+        self.texto     = texto
+        self.pos       = 0
+        self.linea     = 1
+        self.col       = 1
+        self.n         = len(texto)
+        self.errores: List[str] = []
+
+    def _avanzar_whitespace(self):#Funcion que avanza espacios horizontales en blanco y actualiza el contador de columna
+        m = WHITESPACE.match(self.texto, self.pos)
         if not m:
             return
-        span = m.group(0)
-        newlines = span.count("\n")
-        if newlines == 0:
-            #Solo espacios en blanco o tabulaciones
-            self.col += len(span)
-        else:
-            #Actualiza linea y columna si hay saltos de linea
-            last_nl = span.rfind("\n")
-            self.line += newlines
-            self.col = len(span) - last_nl - 1 + 1  #La columna en la nuvea linea debe ser 1
-        self.pos = m.end()
+        self.col += m.end() - self.pos
+        self.pos  = m.end()
 
-    def next_token(self) -> Token:
-        """Devuelve el siguiente token(saltando espacios en blanco). Lanza ValueError en caso de error lexico."""
-        while self.pos < self.n:#Mientras no se llegue al final del texto
-            self._advance_whitespace()#Avanza sobre espacios en blanco
+    def _avanzar_newline(self):#Consume un salto de linea (\n) y actualiza linea/columna
+        self.pos   += 1
+        self.linea += 1
+        self.col    = 1
+
+    def tokenizar_todo(self) -> List[Token]:
+        """
+        Recorre el texto completo y devuelve la lista de todos los tokens, incluyendo el token EOF al final.
+
+        Los caracteres invalidos se reportan en stderr y se saltan; los errores quedan registrados en self.errores.
+        """
+        tokens: List[Token] = []
+
+        while self.pos < self.n:
+            self._avanzar_whitespace() #Saltar espacios horizontales en blanco
             if self.pos >= self.n:
                 break
 
-            for name, rx in TOKENS:
-                m = rx.match(self.text, self.pos)
+            if self.texto[self.pos] == "\n":#Saltar saltos de linea (actualizando contadores)
+                self._avanzar_newline()
+                continue
+
+            #Intentar reconocer un token valido
+            reconocido = False
+            for nombre, patron in TOKENS:
+                m = patron.match(self.texto, self.pos)
                 if m:
-                    lex = m.group(0)
-                    tok = Token(name, lex, self.line, self.col)
-                    #Avanza la posicion y actualiza columna/linea para el lexema que coincide
-                    lines = lex.count("\n")
-                    if lines == 0:
-                        self.col += len(lex)
-                    else:
-                        last_nl = lex.rfind("\n")
-                        self.line += lines
-                        self.col = len(lex) - last_nl - 1 + 1
-                    self.pos = m.end()
-                    return tok
+                    lexema = m.group(0)
+                    tokens.append(Token(nombre, lexema, self.linea, self.col))
 
-            #Si ninguna expresion coincide lanza un error lexico en la posicion actual, para reportar el caracter problematico
-            bad_char = self.text[self.pos]
-            raise ValueError(f"Error lexico en linea {self.line} columna {self.col}: caracter inesperado {bad_char!r}")
+                    #Actualizar posicion y columna (los tokens no contienen \n)
+                    self.col += len(lexema)
+                    self.pos  = m.end()
+                    reconocido = True
+                    break
 
-        return Token("EOF", "", self.line, self.col)
+            #Error lexico: caracter invalido
+            if not reconocido:
+                char_invalido = self.texto[self.pos]
+                msg = (f"[ERROR LEXICO] Linea {self.linea} Col {self.col}: "
+                       f"caracter inesperado {char_invalido!r}")
+                self.errores.append(msg)
+                print(msg, file=sys.stderr)
+                self.col += 1
+                self.pos += 1   #saltar el caracter y continuar
+
+        #EOF explicito al final
+        tokens.append(Token("EOF", "", self.linea, self.col))
+        return tokens
 
 
 class Parser:
     """
-    Analizador sintactico descendente recursivo para JSON simplificado
-    Implementa manejo de errores en panic-mode con sincronizacion
+    Analizador sintactico descendente recursivo para JSON simplificado.
+    Implementa manejo de errores en panic-mode con sincronizacion para continuar el analisis luego de detectar un error sintactico.
     """
 
-    def __init__(self, lexer: Lexer):#Inicializa el parser con una instancia del lexer y lee el primer token
-        self.lexer = lexer
-        self.current = self.lexer.next_token()
-        self.errors: List[str] = []
+    FIRST_ELEMENT = {"L_LLAVE", "L_CORCHETE"}
 
-    def _advance(self):
-        """Consume token actual y lee el siguiente"""
-        prev = self.current
-        self.current = self.lexer.next_token()
-        return prev
+    FIRST_ATTR_VALUE = {
+        "L_LLAVE", "L_CORCHETE",
+        "LITERAL_CADENA", "LITERAL_NUM",
+        "PR_TRUE", "PR_FALSE", "PR_NULL",
+    }
 
-    def _match(self, expected_type: str) -> bool:
-        """Si el token actual coincide con expected_type lo consume y retorna True; si no, retorna False"""
-        if self.current.type == expected_type:
-            self._advance()
+    #Conjuntos de sincronizacion por no-terminal (Panic Mode)
+    #Cada conjunto contiene los tokens "seguros" donde el parser puede retomar el analisis luego de descartar tokens tras un error.
+    SYNC = {
+        "json":            {"EOF"},
+        "element":         {"R_CORCHETE", "R_LLAVE", "COMA", "EOF"},
+        "array":           {"R_CORCHETE", "R_LLAVE", "COMA", "EOF"},
+        "element_list":    {"R_CORCHETE", "EOF"},
+        "object":          {"R_CORCHETE", "R_LLAVE", "COMA", "EOF"},
+        "attributes_list": {"R_LLAVE", "EOF"},
+        "attribute":       {"COMA", "R_LLAVE", "EOF"},
+        "attribute_name":  {"DOS_PUNTOS", "R_LLAVE", "EOF"},
+        "attribute_value": {"COMA", "R_LLAVE", "R_CORCHETE", "EOF"},
+    }
+
+    def __init__(self, tokens: List[Token]):
+        self._tokens  = tokens
+        self._pos     = 0
+        self._errores: List[str] = []
+    
+    #Funciones de uso interno para manejo de tokens, consumo y errores
+    @property
+    def _actual(self) -> Token:
+        """
+        Devuelve el token actual(look-ahead de 1 simbolo) o EOF_TOKEN si se ha llegado al final de la lista de tokens.
+        """
+        if self._pos < len(self._tokens):
+            return self._tokens[self._pos]
+        return EOF_TOKEN
+
+    def _consumir(self, tipo_esperado: str) -> bool:
+        """
+        Verifica que el token actual sea del tipo esperado y avanza el cursor.
+        Si no coincide, registra un error sintactico y devuelve False sin avanzar (el token queda disponible para sincronizacion).
+        """
+        tok = self._actual
+        if tok.tipo == tipo_esperado:
+            self._pos += 1
             return True
+        #Construir mensaje de error con posicion precisa
+        pos_str = (f"Linea {tok.linea} Col {tok.col}"
+                   if tok.tipo != "EOF" else "fin de archivo")
+        self._errores.append(
+            f"[ERROR SINTACTICO] {pos_str}: "
+            f"se esperaba '{tipo_esperado}' "
+            f"pero se encontro '{tok.tipo}' ({tok.lexema!r})"
+        )
         return False
 
-    def _error(self, message: str):
-        """Registrar un error con la posicion del token actual"""
-        tok = self.current
-        msg = f"[Linea {tok.line} Col {tok.col}] {message} (token actual: {tok.type} {tok.lexeme!r})"
-        self.errors.append(msg)
+    def _sincronizar(self, non_terminal: str):
+        """
+        Panic Mode: descarta tokens hasta encontrar uno en el conjunto de sincronizacion del no-terminal dado (o EOF).
+        """
+        sync_set = self.SYNC.get(non_terminal, {"EOF"})
+        while self._actual.tipo not in sync_set:
+            self._pos += 1
 
-    def _expected_close_lexeme(self, expected_token_type: str) -> str:
+    def _error(self, non_terminal: str, esperados: str):
         """
-        Dado un tipo de token esperado (R_CORCHETE o R_LLAVE) devuelve el lexema ']' o '}' para usar en mensajes de error        
+        Registra un error de token inesperado y activa Panic Mode para el no-terminal indicado.
         """
-        mapping = {
-            "R_CORCHETE": "]",
-            "R_LLAVE": "}",
-        }
-        return mapping.get(expected_token_type, expected_token_type)
+        tok     = self._actual
+        pos_str = (f"Linea {tok.linea} Col {tok.col}"
+                   if tok.tipo != "EOF" else "fin de archivo")
+        self._errores.append(
+            f"[ERROR SINTACTICO] {pos_str}: "
+            f"token inesperado '{tok.tipo}' ({tok.lexema!r}) "
+            f"al analizar <{non_terminal}>. "
+            f"Se esperaba: {esperados}"
+        )
+        self._sincronizar(non_terminal)
 
-    def synchronize(self, sync_set: List[str]):
+    #Punto de entrada al analisis sintactico
+    def analizar(self) -> bool:
         """
-        Panic-mode: consumir tokens hasta encontrar uno cuyo tipo este en sync_set o EOF
-        Retorna el token en el que se sincronizo (o EOF)
+        Inicia el analisis desde el simbolo inicial <json>.
+        Retorna True si no hubo errores sintacticos.
         """
-        while self.current.type != "EOF" and self.current.type not in sync_set:
-            try:
-                self._advance()
-            except ValueError:
-                #Existe un error lexico que impide avanzar
-                break
-        return self.current
-
-    #Reglas de produccion del analizador sintactico
-    def parse(self) -> bool:
-        """
-        Entrada: json => element EOF
-        Devuelve True si no hubo errores sintacticos
-        """
-        self.element()
-        #Espera EOF al final del archivo
-        if self.current.type != "EOF":
-            self._error("Se esperaba EOF al final del archivo")
-        return len(self.errors) == 0
-
-    def element(self):
-        """Valida si el elemento es un object o un array"""
-        if self.current.type == "L_LLAVE":
-            self.object()
-        elif self.current.type == "L_CORCHETE":
-            self.array()
+        self._json()
+        return len(self._errores) == 0
+    
+    #Reglas gramaticales (un metodo por no-terminal)
+    def _json(self):
+        """json => element EOF"""
+        if self._actual.tipo in self.FIRST_ELEMENT:
+            self._element()
         else:
-            self._error("Se esperaba 'object' o 'array' al inicio de 'element'")
-            sync_tokens = ["COMA", "R_LLAVE", "R_CORCHETE", "EOF"]
-            self.synchronize(sync_tokens)
+            self._error("json", "'{' para objeto  o  '[' para array")
+            #Recuperacion: si tras sincronizar hay un element, procesarlo
+            if self._actual.tipo in self.FIRST_ELEMENT:
+                self._element()
 
-    def array(self):
-        """
-        Valida un array JSON que puede estar vacio o contener una lista de elementos
-        Si despues de '[' viene ']' entonces vacia, sino parsear element-list hasta ']' o un error
-        """
-        if not self._match("L_CORCHETE"):
-            self._error("Se esperaba '[' para iniciar array")
-            return
+        #Verificar EOF estricto (no deben quedar tokens extra)
+        if self._actual.tipo != "EOF":
+            tok = self._actual
+            self._errores.append(
+                f"[ERROR SINTACTICO] Linea {tok.linea} Col {tok.col}: "
+                f"tokens extra luego del elemento raiz: "
+                f"'{tok.tipo}' ({tok.lexema!r})"
+            )
 
-        if self._match("R_CORCHETE"):
-            return
-
-        #Parseamos al menos un element, luego repetimos si hay comas
-        self.element()
-        #Bucle: cuidamos 2 casos de error comunes:
-        #Si aparece ',' consumimos y parseamos siguiente element
-        #Si aparece directamente otro elemento sin ',', reportamos "falta ','" y seguimos parseando el siguiente
-        while True:
-            if self._match("COMA"):
-                #Luego de la coma debe venir un element
-                if self.current.type not in ("L_LLAVE", "L_CORCHETE"):
-                    self._error("Se esperaba 'element' despues de ',' en array")
-                    self.synchronize(["COMA", "R_CORCHETE", "R_LLAVE", "EOF"])
-                    #Si llegamos al cierre del array, salimos del bucle
-                    if self.current.type == "R_CORCHETE":
-                        break
-                else:
-                    self.element()
-                continue
-
-            #Si no hay coma, pero directamente viene otro elemento entonces falto la coma entre elementos
-            if self.current.type in ("L_LLAVE", "L_CORCHETE"):
-                self._error("Falta ',' entre elementos del array")
-                #Intentamos parsear el siguiente elemento para continuar
-                self.element()
-                continue
-
-            #Si llega cierre del array o cualquier otro token, salimos del bucle y lo manejamos abajo
-            break
-
-        #Al terminar esperamos el cierre correcto del array
-        if not self._match("R_CORCHETE"):
-            expected_lex = self._expected_close_lexeme("R_CORCHETE")
-            self._error(f"Falta '{expected_lex}' de cierre del array")
-            self.synchronize(["COMA", "R_CORCHETE", "R_LLAVE", "EOF"])
-            if self.current.type == "R_CORCHETE":
-                self._advance()
-
-    def object(self):
-        """
-        Verifica un object JSON que puede estar vacio o contener una lista de atributos
-        """
-        if not self._match("L_LLAVE"):
-            self._error("Se esperaba '{' para iniciar object")
-            return
-
-        if self._match("R_LLAVE"):
-            return
-
-        #Parsear el primer atributo
-        self.attribute()
-        #Si hay coma, seguir parseando atributos
-        while self._match("COMA"):
-            #Si despues de coma no viene LITERAL_CADENA entonces error
-            if self.current.type != "LITERAL_CADENA":
-                self._error("Se esperaba nombre de atributo(LITERAL_CADENA) despues de ','")
-                #Sincronizar hasta siguiente atributo posible o cierre
-                self.synchronize(["LITERAL_CADENA", "R_LLAVE", "COMA", "R_CORCHETE", "EOF"])
-            self.attribute()
-
-        #Esperar cierre de llave
-        if not self._match("R_LLAVE"):
-            expected_lex = self._expected_close_lexeme("R_LLAVE")
-            self._error(f"Falta '{expected_lex}' de cierre del object")
-            self.synchronize(["COMA", "R_LLAVE", "R_CORCHETE", "EOF"])
-            if self.current.type == "R_LLAVE":
-                self._advance()
-
-    def attribute(self):
-        """Valida un atributo dentro de un object JSON"""
-        if self.current.type != "LITERAL_CADENA":
-            self._error("Se esperaba nombre de atributo (LITERAL_CADENA)")
-            #Intenta sincronizar hasta dos puntos o coma o cierre
-            self.synchronize(["DOS_PUNTOS", "COMA", "R_LLAVE", "R_CORCHETE", "EOF"])
-            #Si encontramos DOS_PUNTOS lo consumimos y seguimos; si no, regresamos
-            if self.current.type != "DOS_PUNTOS":
-                return
-        #Consumir LITERAL_CADENA(nombre del atributo)
-        if self.current.type == "LITERAL_CADENA":
-            self._advance()
-
-        #Esperar dos puntos
-        if not self._match("DOS_PUNTOS"):
-            self._error("Se esperaba ':' despues del nombre del atributo")
-            #Se sincroniza hasta un token que pueda iniciar un valor o cierre/coma
-            self.synchronize(["L_LLAVE", "L_CORCHETE", "LITERAL_CADENA", "LITERAL_NUM", "PR_TRUE", "PR_FALSE", "PR_NULL", "COMA", "R_LLAVE", "EOF"])
-            #En caso de que no hay token de valor valido, salimos de attribute
-            if self.current.type not in ("L_LLAVE", "L_CORCHETE", "LITERAL_CADENA", "LITERAL_NUM", "PR_TRUE", "PR_FALSE", "PR_NULL"):
-                return
-
-        self.attribute_value()
-
-    def attribute_value(self):
-        """
-        Valida el valor de un atributo JSON segun
-        attribute-value => element | LITERAL_CADENA | LITERAL_NUM | true | false | null
-        """
-        if self.current.type in ("L_LLAVE", "L_CORCHETE"):
-            self.element()
-        elif self.current.type in ("LITERAL_CADENA", "LITERAL_NUM", "PR_TRUE", "PR_FALSE", "PR_NULL"):
-            self._advance()
+    def _element(self):
+        """element => object | array"""
+        if self._actual.tipo == "L_LLAVE":
+            self._object()
+        elif self._actual.tipo == "L_CORCHETE":
+            self._array()
         else:
-            self._error("Se esperaba un valor de atributo (element, LITERAL_CADENA, LITERAL_NUM, true, false o null)")
-            #Sincronizar hasta coma o cierre de objeto/array para continuar
-            self.synchronize(["COMA", "R_LLAVE", "R_CORCHETE", "EOF"])
+            self._error("element", "'{' para objeto  o  '[' para array")
 
+    def _array(self):
+        """array => [ element-list ]  |  [ ]"""
+        self._consumir("L_CORCHETE")
 
-# -----------------------
-# Programa principal
-# -----------------------
+        if self._actual.tipo == "R_CORCHETE":
+            self._consumir("R_CORCHETE")      #array vacio []
+            return
 
-def tokenize_all(text: str) -> List[Token]:
-    """Devuelve la lista completa de tokens (incluye EOF) o error lexico como token especia"""
-    lex = Lexer(text)
-    tokens = []
-    try:
-        while True:
-            t = lex.next_token()
-            tokens.append(t)
-            if t.type == "EOF":
-                break
-    except ValueError as e:
-        #El error lexico se registrarlo como token especial y dejar EOF
-        tokens.append(Token("LEX_ERROR", str(e), lex.line, lex.col))
-        #No se intenta seguir realizando el analisis lexico
-        tokens.append(Token("EOF", "", lex.line, lex.col))
-    return tokens
+        if self._actual.tipo in self.FIRST_ELEMENT:
+            self._element_list()
+        else:
+            self._error(
+                "array",
+                "']' para array vacio  o  '{' / '[' para un elemento"
+            )
 
+        #Cerrar el array
+        if not self._consumir("R_CORCHETE"):
+            self._sincronizar("array")
+            if self._actual.tipo == "R_CORCHETE":
+                self._consumir("R_CORCHETE")
 
-def write_tokens_file(tokens: List[Token], out_path: Path):
-    """Genera un archivo con la lista de tokens, para debug o revision"""
-    with out_path.open("w", encoding="utf-8") as f:
-        for t in tokens:
-            if t.type == "EOF":
-                continue
-            if t.type == "LEX_ERROR":
-                f.write(f"ERROR_LEXICO {t.lexeme}\n")
+    def _element_list(self):
+        """
+        element-list => element { , element }
+        (iterativa — recursion izquierda eliminada)
+        """
+        self._element()
+
+        while self._actual.tipo == "COMA":
+            self._consumir("COMA")
+            if self._actual.tipo in self.FIRST_ELEMENT:
+                self._element()
             else:
-                f.write(f"{t.type} {t.lexeme}\n")
+                self._error(
+                    "element_list",
+                    "'{' o '[' para un elemento luego de la coma"
+                )
+                #Si tras sincronizar aun hay un element, procesarlo
+                if self._actual.tipo in self.FIRST_ELEMENT:
+                    self._element()
+
+    def _object(self):
+        """object => { attributes-list }  |  { }"""
+        self._consumir("L_LLAVE")
+
+        if self._actual.tipo == "R_LLAVE":
+            self._consumir("R_LLAVE")         #objeto vacio {}
+            return
+
+        if self._actual.tipo == "LITERAL_CADENA":
+            self._attributes_list()
+        else:
+            self._error(
+                "object",
+                "'}' para objeto vacio  o  una cadena como nombre de atributo"
+            )
+
+        #Cerrar el objeto
+        if not self._consumir("R_LLAVE"):
+            self._sincronizar("object")
+            if self._actual.tipo == "R_LLAVE":
+                self._consumir("R_LLAVE")
+
+    def _attributes_list(self):
+        """
+        attributes-list => attribute { , attribute }
+        (iterativa — recursion izquierda eliminada)
+        """
+        self._attribute()
+
+        while self._actual.tipo == "COMA":
+            self._consumir("COMA")
+            if self._actual.tipo == "LITERAL_CADENA":
+                self._attribute()
+            else:
+                self._error(
+                    "attributes_list",
+                    "cadena como nombre de atributo luego de la coma"
+                )
+                if self._actual.tipo == "LITERAL_CADENA":
+                    self._attribute()
+
+    def _attribute(self):
+        """attribute => attribute-name : attribute-value"""
+        self._attribute_name()
+        #Si falta el ':', sincronizar y salir — no intentar parsear el valor
+        #(evita errores espurios sobre el token siguiente)
+        if not self._consumir("DOS_PUNTOS"):
+            self._sincronizar("attribute")
+            return
+        self._attribute_value()
+
+    def _attribute_name(self):
+        """attribute-name => LITERAL_CADENA"""
+        if self._actual.tipo == "LITERAL_CADENA":
+            self._consumir("LITERAL_CADENA")
+        else:
+            self._error(
+                "attribute_name",
+                "cadena entre comillas dobles como nombre de atributo"
+            )
+
+    def _attribute_value(self):
+        """
+        attribute-value => element | LITERAL_CADENA | LITERAL_NUM
+                         | PR_TRUE | PR_FALSE | PR_NULL
+        """
+        if self._actual.tipo in self.FIRST_ELEMENT:
+            self._element()
+        elif self._actual.tipo in self.FIRST_ATTR_VALUE:
+            self._pos += 1      #consumir el terminal directamente
+        else:
+            self._error(
+                "attribute_value",
+                "objeto, array, cadena, numero, true, false o null"
+            )
+
+    
+    #Reporte de resultados
+    
+
+    def reportar(self):
+        """Imprime en stdout el resultado del analisis sintactico."""
+        sep = "=" * 62
+        if not self._errores:
+            print(sep)
+            print("  RESULTADO: Fuente sintacticamente CORRECTO")
+            print(sep)
+        else:
+            print(sep)
+            print(f"  RESULTADO: {len(self._errores)} error(es) sintactico(s) encontrado(s)")
+            print(sep)
+            for err in self._errores:
+                print(" ", err)
+            print(sep)
+
+
+
+#5. MAIN
 
 
 def main():
-    #Se define el archivo de entrada
-    in_file = Path("fuente.txt")#Nombre por defecto
+    archivo_entrada = "fuente.txt"
+    if len(sys.argv) >= 2:
+        archivo_entrada = sys.argv[1]
 
-    if not in_file.exists():
-        print(f"Archivo no encontrado: {in_file}")
+    path = Path(archivo_entrada)
+    if not path.exists():
+        print(f"[ERROR] No se encontro el archivo: '{archivo_entrada}'",
+              file=sys.stderr)
         sys.exit(1)
 
-    text = in_file.read_text(encoding="utf-8")
+    print(f"\nAnalizando: {path}")
+    print("-" * 62)
 
-    #Tokenizar todo
-    tokens = tokenize_all(text)
-    write_tokens_file(tokens, Path("salida_tokens.txt"))
-    print("Tokens escritos en salida_tokens.txt")
+    #── Fase 1: Analisis Lexico ────────────────────────────────────────
+    lexer  = Lexer(path.read_text(encoding="utf-8"))
+    tokens = lexer.tokenizar_todo()
 
-    #En caso de haber un error lexico, mostrar y abortar parseo
-    lex_errors = [t for t in tokens if t.type == "LEX_ERROR"]
-    if lex_errors:
-        print("Errores lexicos detectados:")
-        for e in lex_errors:
-            print("  -", e.lexeme)
-        print("No se realizara analisis sintactico hasta corregir errores lexicos.")
-        sys.exit(1)
-
-    #Inicializar lexer y parser
-    parser = Parser(Lexer(text))
-    ok = parser.parse()
-
-    #Imprimir resultados
-    if ok:
-        print("Fuente sintacticamente correcto")
+    if lexer.errores:
+        print(f"  Errores lexicos   : {len(lexer.errores)}")
+        print("  (el analisis sintactico continua sobre los tokens validos)")
     else:
-        print("Se encontraron errores sintacticos:")
-        for err in parser.errors:
-            print("  -", err)
+        print("  Analisis lexico   : OK")
 
-    #Codigo de salida segun resultado
-    sys.exit(0 if ok else 2)
+    #── Fase 2: Analisis Sintactico ────────────────────────────────────
+    parser = Parser(tokens)
+    ok     = parser.analizar()
+    parser.reportar()
+
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
