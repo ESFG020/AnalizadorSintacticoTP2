@@ -219,18 +219,18 @@ class Parser:
         self._json()
         return len(self._errores) == 0
     
-    #Reglas gramaticales (un metodo por no-terminal)
+    #Reglas gramaticales implementadas como funciones de la clase Parser
     def _json(self):
         """json => element EOF"""
         if self._actual.tipo in self.FIRST_ELEMENT:
             self._element()
         else:
             self._error("json", "'{' para objeto  o  '[' para array")
-            #Recuperacion: si tras sincronizar hay un element, procesarlo
+            #Recuperacion: si tras sincronizar hay un element, se debe procesarlo
             if self._actual.tipo in self.FIRST_ELEMENT:
                 self._element()
 
-        #Verificar EOF estricto (no deben quedar tokens extra)
+        #Verificar EOF estricto (no se permiten tokens extra luego del elemento raiz)
         if self._actual.tipo != "EOF":
             tok = self._actual
             self._errores.append(
@@ -273,7 +273,6 @@ class Parser:
     def _element_list(self):
         """
         element-list => element { , element }
-        (iterativa — recursion izquierda eliminada)
         """
         self._element()
 
@@ -286,7 +285,7 @@ class Parser:
                     "element_list",
                     "'{' o '[' para un elemento luego de la coma"
                 )
-                #Si tras sincronizar aun hay un element, procesarlo
+                #Si tras sincronizar aun hay un element, debemos procesarlo
                 if self._actual.tipo in self.FIRST_ELEMENT:
                     self._element()
 
@@ -295,7 +294,7 @@ class Parser:
         self._consumir("L_LLAVE")
 
         if self._actual.tipo == "R_LLAVE":
-            self._consumir("R_LLAVE")         #objeto vacio {}
+            self._consumir("R_LLAVE")         #simboliza un objeto vacio {}
             return
 
         if self._actual.tipo == "LITERAL_CADENA":
@@ -315,7 +314,6 @@ class Parser:
     def _attributes_list(self):
         """
         attributes-list => attribute { , attribute }
-        (iterativa — recursion izquierda eliminada)
         """
         self._attribute()
 
@@ -334,8 +332,7 @@ class Parser:
     def _attribute(self):
         """attribute => attribute-name : attribute-value"""
         self._attribute_name()
-        #Si falta el ':', sincronizar y salir — no intentar parsear el valor
-        #(evita errores espurios sobre el token siguiente)
+        #Si falta el ':', entoncesn sincronizar y salir, no intentar parsear el valor para evitar cascada de errores
         if not self._consumir("DOS_PUNTOS"):
             self._sincronizar("attribute")
             return
@@ -368,8 +365,6 @@ class Parser:
 
     
     #Reporte de resultados
-    
-
     def reportar(self):
         """Imprime en stdout el resultado del analisis sintactico."""
         sep = "=" * 62
@@ -387,9 +382,6 @@ class Parser:
 
 
 
-#5. MAIN
-
-
 def main():
     archivo_entrada = "fuente.txt"
     if len(sys.argv) >= 2:
@@ -404,7 +396,7 @@ def main():
     print(f"\nAnalizando: {path}")
     print("-" * 62)
 
-    #── Fase 1: Analisis Lexico ────────────────────────────────────────
+    # Fase 1: Se realiza el Analisis Lexico 
     lexer  = Lexer(path.read_text(encoding="utf-8"))
     tokens = lexer.tokenizar_todo()
 
@@ -414,7 +406,7 @@ def main():
     else:
         print("  Analisis lexico   : OK")
 
-    #── Fase 2: Analisis Sintactico ────────────────────────────────────
+    # Fase 2: Iniciamos con el Analisis Sintactico
     parser = Parser(tokens)
     ok     = parser.analizar()
     parser.reportar()
